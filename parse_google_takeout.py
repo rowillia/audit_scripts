@@ -1,8 +1,9 @@
 import csv
-from itertools import count
+from enum import Enum
 import json
+from calendar import month_abbr
 from collections import Counter, defaultdict
-from datetime import datetime, time, timedelta, date, tzinfo
+from datetime import datetime, timedelta, date, tzinfo
 from pathlib import Path
 from typing import (
     DefaultDict,
@@ -45,7 +46,7 @@ class ParsedVisit(NamedTuple):
     location: Location
     state: str
     start_date: date
-    end_date: date
+    end_date: Optional[date]
     near_office: bool
 
 
@@ -89,8 +90,26 @@ class TimelineObject(TypedDict):
     activitySegment: ActivitySegment
 
 
+class LocationHistoryLocation(TypedDict):
+    timestampMs: int
+    latitudeE7: int
+    longitudeE7: int
+    accuracy: int
+
+
+class LocationHistory(TypedDict):
+    locations: List[LocationHistoryLocation]
+
+
 class TimelineMonth(TypedDict):
     timelineObjects: List[TimelineObject]
+
+
+class DayType(Enum):
+    WEEKEND = "W"
+    HOLIDAY = "H"
+    WORKING = "Y"
+    VACATION = "V"
 
 
 class Geocoder:
@@ -101,12 +120,16 @@ class Geocoder:
         office_locations: List[Location],
         office_distance_threshold_km: float = 0.75,
     ) -> None:
+        print("\tParsing States geojson...", end="", flush=True)
         self.states_geojson: List[Tuple[str, Polygon]] = self._load_geojson(
             states_geojson_file, "NAME"
         )
+        print("Done")
+        print("\tParsing Countries geojson...", end="", flush=True)
         self.countries_geojson: List[Tuple[str, Polygon]] = self._load_geojson(
             countries_geojson_file, "ADMIN"
         )
+        print("Done")
         self.office_locations = office_locations
         self.office_distance_threshold_km = office_distance_threshold_km
 
@@ -132,7 +155,7 @@ class Geocoder:
                 return state_name
         for index, (country_name, country_shape) in enumerate(self.countries_geojson):
             if p.within(country_shape):
-                # Keep most visited states towards the top
+                # Keep most visited countries towards the top
                 self.countries_geojson.insert(0, self.countries_geojson.pop(index))
                 return f"Outside US/{country_name}"
         return None
@@ -163,10 +186,14 @@ class Calendar:
         holidays_for_year[christmas_eve] = "Christmas Eve"
         self._holiday_cache[year] = holidays_for_year
 
-    def is_working_day(self, d: date) -> bool:
+    def day_type(self, d: date) -> bool:
         if d.year not in self._holiday_cache:
             self._populate_year(d.year)
-        return d.weekday() not in [5, 6] and d not in self._holiday_cache[d.year]
+        if d.weekday() in [5, 6]:
+            return DayType.WEEKEND
+        if d in self._holiday_cache[d.year]:
+            return DayType.HOLIDAY
+        return DayType.WORKING
 
 
 class TakeoutParser:
@@ -198,8 +225,6 @@ class TakeoutParser:
         state = self.geocoder.find_state(location) or ""
         near_office = self.geocoder.is_near_office(location)
 
-        if start_timestamp.astimezone(self.timezone).date() == date(2016, 10, 21):
-            print(json.dumps(visit))
         return ParsedVisit(
             location,
             state.strip(),
@@ -238,8 +263,6 @@ class TakeoutParser:
                     near_office = True
                     break
 
-        if start_timestamp.astimezone(self.timezone).date() == date(2016, 10, 21):
-            print(json.dumps(visit))
         return ParsedVisit(
             start_location,
             start_state.strip() if start_near_office else end_state.strip(),
@@ -247,6 +270,38 @@ class TakeoutParser:
             end_timestamp.astimezone(self.timezone).date(),
             near_office,
         )
+
+    def parse_location_history_file(
+        self,
+        result: DefaultDict[date, Set[Tuple[str, bool]]],
+        start_date: date,
+        end_date: date,
+    ) -> None:
+        print("\tParsing Location History.json...", end="", flush=True)
+        location_history_file = (
+            self.takeout_dir / "Location History" / "Location History.json"
+        )
+        location_history: LocationHistory = json.loads(
+            location_history_file.read_text(encoding="utf8")
+        )
+        print("Done")
+        print("\tProcessesing Location History.json...", end="", flush=True)
+        for location in location_history["locations"]:
+            location_timestamp = datetime.fromtimestamp(
+                int(location["timestampMs"]) / 1000
+            ).astimezone(self.timezone)
+            if not (start_date <= location_timestamp.date() <= end_date):
+                continue
+            location = Location(
+                location["latitudeE7"] / 1e7,
+                location["longitudeE7"] / 1e7,
+            )
+            state = self.geocoder.find_state(location) or ""
+            if (state, True) in result[location_timestamp.date()]:
+                continue
+            near_office = self.geocoder.is_near_office(location)
+            result[location_timestamp.date()].add((state, near_office))
+        print("Done")
 
     def parse_semantic_location_file(
         self,
@@ -295,26 +350,42 @@ class TakeoutParser:
         start_date: date,
         end_date: date,
         state: str,
-    ) -> List[Tuple[date, str, bool]]:
-        details: List[Tuple[date, str, bool]] = []
+    ) -> List[Tuple[date, str, DayType]]:
+        details: List[Tuple[date, str, DayType]] = []
         visit_map: DefaultDict[date, Set[Tuple[str, bool]]] = defaultdict(set)
         years = set()
         last_state = state
+        self.parse_location_history_file(visit_map, start_date, end_date)
         for d in daterange(start_date, end_date):
             if d.year not in years:
                 self.parse_semantic_year(d.year, visit_map)
                 years.add(d.year)
             if d not in visit_map:
-                details.append((d, last_state, self.calendar.is_working_day(d)))
+                details.append((d, last_state, self.calendar.day_type(d)))
             else:
                 visit_day = visit_map[d]
+                day_type = self.calendar.day_type(d)
                 for visits in visit_day:
-                    if visits[1] and self.calendar.is_working_day(d):
-                        details.append((d, visits[0], visits[1]))
-                        last_state = visits[0]
+                    if visits[1] and day_type == DayType.WORKING:
+                        details.append(
+                            (
+                                d,
+                                visits[0] or last_state,
+                                DayType.WORKING,
+                            )
+                        )
+                        last_state = visits[0] or last_state
                         break
                 else:
-                    details.append((d, visits[0], False))
+                    details.append(
+                        (
+                            d,
+                            visits[0] or last_state,
+                            DayType.VACATION
+                            if day_type == DayType.WORKING
+                            else day_type,
+                        )
+                    )
         return details
 
 
@@ -324,6 +395,7 @@ OFFICE_LOCATIONS = [
     Location(47.605527, -122.337297),
     Location(45.528588, -122.663336),
     Location(39.786562, -104.918720),
+    Location(39.766362, -86.160946),
     Location(36.163415, -86.776012),
     Location(34.052376, -118.255906),
     Location(40.741238, -74.0008963),
@@ -353,10 +425,10 @@ def days_in_state(
     takeout_dir: str,
     states_geojson: str,
     countries_geojson: str,
-    state,
-    csv_out,
-    start_date,
-    end_date,
+    state: str,
+    csv_out: str,
+    start_date: str,
+    end_date: str,
 ):
     geocoder = Geocoder(Path(states_geojson), Path(countries_geojson), OFFICE_LOCATIONS)
     calendar = Calendar(["Columbus Day", "Veterans Day"])
@@ -371,18 +443,23 @@ def days_in_state(
         end,
         state,
     )
-    days_working = sum(x[2] for x in details)
-    days_working_by_state = Counter(x[1] for x in details if x[2])
+    days_working = sum(x[2] == DayType.WORKING for x in details)
+    days_working_by_state = Counter(x[1] for x in details if x[2] == DayType.WORKING)
     click.echo(f"Report:")
     click.echo(f"\tTotal Days Worked: {days_working}")
     for state, days_worked in days_working_by_state.most_common():
         click.echo(f"\tTotal Days Worked in {state}: {days_worked}")
     if csv_out:
+        result = [{"Day": x + 1} for x in range(31)]
+        for day in details:
+            value = f"{day[1]},{day[2].value}" if day[2] != DayType.WEEKEND else ""
+            result[day[0].day - 1][day[0].strftime("%b")] = value
         with open(csv_out, "w", newline="") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(["Date", "State", "Working"])
-            for day in details:
-                writer.writerow([day[0].strftime("%Y-%m-%d"), day[1], day[2]])
+            field_names = ["Day"] + [month_abbr[x] for x in range(1, 13)]
+            writer = csv.DictWriter(csvfile, fieldnames=field_names)
+            writer.writeheader()
+            for row in result:
+                writer.writerow(row)
 
 
 if __name__ == "__main__":
